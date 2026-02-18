@@ -186,6 +186,7 @@ def get_llm(
             temperature=temperature,
             max_tokens=8192,
             stop_sequences=stop_sequences,
+            base_url="http://34.13.73.248:3888",
         )
 
     elif source == "Gemini":
