@@ -3,11 +3,13 @@ import asyncio
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import traceback
 import urllib.request
 import zipfile
+from datetime import datetime
 from typing import Any
 
 # ------------------------------------------------------------
@@ -652,3 +654,371 @@ def _create_test_result(
             warnings.append(f"Failed to save test report: {str(e)}")
 
     return result
+
+
+_WETLAB_TABLE_NAME = "wetlab_results"
+_WETLAB_KEY_FIELDS = ("experiment_id", "sample_id", "assay_name", "condition", "replicate")
+_WETLAB_REQUIRED_RECORD_FIELDS = (
+    "experiment_id",
+    "sample_id",
+    "assay_name",
+    "condition",
+    "replicate",
+    "measurement_value",
+    "measurement_unit",
+    "measured_at",
+)
+_WETLAB_UPDATABLE_FIELDS = {
+    "measurement_value",
+    "measurement_unit",
+    "operator",
+    "instrument",
+    "measured_at",
+    "notes",
+}
+_WETLAB_QUERYABLE_FIELDS = {
+    "experiment_id",
+    "sample_id",
+    "assay_name",
+    "condition",
+    "replicate",
+    "measurement_unit",
+    "operator",
+    "instrument",
+}
+
+
+def _connect_wetlab_db(db_path: str) -> tuple[sqlite3.Connection, str]:
+    if not db_path or not str(db_path).strip():
+        raise ValueError("db_path cannot be empty.")
+
+    resolved_db_path = os.path.abspath(os.path.expanduser(str(db_path).strip()))
+    db_dir = os.path.dirname(resolved_db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    conn = sqlite3.connect(resolved_db_path)
+    conn.row_factory = sqlite3.Row
+    return conn, resolved_db_path
+
+
+def _ensure_wetlab_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_WETLAB_TABLE_NAME} (
+            result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT NOT NULL,
+            sample_id TEXT NOT NULL,
+            assay_name TEXT NOT NULL,
+            condition TEXT NOT NULL,
+            replicate INTEGER NOT NULL,
+            measurement_value REAL NOT NULL,
+            measurement_unit TEXT NOT NULL,
+            operator TEXT,
+            instrument TEXT,
+            measured_at TEXT NOT NULL,
+            notes TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (experiment_id, sample_id, assay_name, condition, replicate)
+        )
+        """
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{_WETLAB_TABLE_NAME}_experiment_id ON {_WETLAB_TABLE_NAME} (experiment_id)"
+    )
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{_WETLAB_TABLE_NAME}_sample_id ON {_WETLAB_TABLE_NAME} (sample_id)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{_WETLAB_TABLE_NAME}_assay_name ON {_WETLAB_TABLE_NAME} (assay_name)")
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{_WETLAB_TABLE_NAME}_measured_at ON {_WETLAB_TABLE_NAME} (measured_at)"
+    )
+
+
+def _validate_wetlab_key(key: dict) -> tuple[bool, str]:
+    if not isinstance(key, dict):
+        return False, "key must be a dictionary."
+    missing = [field for field in _WETLAB_KEY_FIELDS if field not in key]
+    if missing:
+        return False, "Missing key fields: " + ", ".join(missing)
+    return True, ""
+
+
+def _format_wetlab_rows(columns: list[str], rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return ""
+
+    values = [[("" if row[col] is None else str(row[col])) for col in columns] for row in rows]
+    widths = [len(col) for col in columns]
+    for row_values in values:
+        for idx, item in enumerate(row_values):
+            widths[idx] = max(widths[idx], len(item))
+
+    header = " | ".join(col.ljust(widths[idx]) for idx, col in enumerate(columns))
+    separator = "-+-".join("-" * widths[idx] for idx in range(len(columns)))
+    body = [" | ".join(item.ljust(widths[idx]) for idx, item in enumerate(row_values)) for row_values in values]
+    return "\n".join([header, separator] + body)
+
+
+def init_wetlab_results_table(db_path: str) -> str:
+    """Initialize the wetlab_results table and indexes in a SQLite database."""
+    try:
+        conn, resolved_db_path = _connect_wetlab_db(db_path)
+        with conn:
+            _ensure_wetlab_table(conn)
+        conn.close()
+        return (
+            "Wetlab results table initialized successfully.\n"
+            f"Database: {resolved_db_path}\n"
+            f"Table: {_WETLAB_TABLE_NAME}"
+        )
+    except Exception as e:
+        return f"Error initializing wetlab results table: {str(e)}"
+
+
+def upsert_wetlab_results(db_path: str, records: list[dict]) -> str:
+    """Upsert multiple wetlab result rows using the table's composite unique key."""
+    if not isinstance(records, list) or not records:
+        return "Error: records must be a non-empty list of dictionaries."
+
+    try:
+        conn, resolved_db_path = _connect_wetlab_db(db_path)
+        with conn:
+            _ensure_wetlab_table(conn)
+
+            upsert_sql = f"""
+                INSERT INTO {_WETLAB_TABLE_NAME} (
+                    experiment_id, sample_id, assay_name, condition, replicate,
+                    measurement_value, measurement_unit, operator, instrument, measured_at, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(experiment_id, sample_id, assay_name, condition, replicate)
+                DO UPDATE SET
+                    measurement_value = excluded.measurement_value,
+                    measurement_unit = excluded.measurement_unit,
+                    operator = excluded.operator,
+                    instrument = excluded.instrument,
+                    measured_at = excluded.measured_at,
+                    notes = excluded.notes,
+                    updated_at = CURRENT_TIMESTAMP
+            """
+
+            success_count = 0
+            error_details = []
+            for idx, record in enumerate(records, start=1):
+                if not isinstance(record, dict):
+                    error_details.append(f"Record {idx}: not a dictionary.")
+                    continue
+
+                missing = [field for field in _WETLAB_REQUIRED_RECORD_FIELDS if field not in record]
+                if missing:
+                    error_details.append(f"Record {idx}: missing required fields {missing}.")
+                    continue
+
+                try:
+                    values = (
+                        str(record["experiment_id"]).strip(),
+                        str(record["sample_id"]).strip(),
+                        str(record["assay_name"]).strip(),
+                        str(record["condition"]).strip(),
+                        int(record["replicate"]),
+                        float(record["measurement_value"]),
+                        str(record["measurement_unit"]).strip(),
+                        None if record.get("operator") is None else str(record.get("operator")).strip(),
+                        None if record.get("instrument") is None else str(record.get("instrument")).strip(),
+                        str(record["measured_at"]).strip(),
+                        None if record.get("notes") is None else str(record.get("notes")),
+                    )
+                    conn.execute(upsert_sql, values)
+                    success_count += 1
+                except Exception as e:
+                    error_details.append(f"Record {idx}: {str(e)}")
+
+        conn.close()
+        lines = [
+            "Wetlab result UPSERT completed.",
+            f"Database: {resolved_db_path}",
+            f"Input records: {len(records)}",
+            f"Successful upserts: {success_count}",
+            f"Failed records: {len(error_details)}",
+        ]
+        if error_details:
+            lines.append("Failure details:")
+            for detail in error_details[:20]:
+                lines.append(f"- {detail}")
+            if len(error_details) > 20:
+                lines.append(f"- ... and {len(error_details) - 20} more")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error upserting wetlab results: {str(e)}"
+
+
+def update_wetlab_result(db_path: str, key: dict, updates: dict) -> str:
+    """Update one wetlab result row selected by the composite key."""
+    try:
+        key_valid, key_error = _validate_wetlab_key(key)
+        if not key_valid:
+            return f"Error: {key_error}"
+        if not isinstance(updates, dict) or not updates:
+            return "Error: updates must be a non-empty dictionary."
+
+        invalid_fields = [field for field in updates if field not in _WETLAB_UPDATABLE_FIELDS]
+        if invalid_fields:
+            return "Error: unsupported update fields: " + ", ".join(invalid_fields)
+
+        conn, resolved_db_path = _connect_wetlab_db(db_path)
+        with conn:
+            _ensure_wetlab_table(conn)
+
+            set_clauses = []
+            values = []
+            for field, value in updates.items():
+                if field == "measurement_value":
+                    value = float(value)
+                elif field in {"measurement_unit", "operator", "instrument", "measured_at", "notes"} and value is not None:
+                    value = str(value)
+                set_clauses.append(f"{field} = ?")
+                values.append(value)
+            set_clauses.append("updated_at = ?")
+            values.append(datetime.utcnow().isoformat(timespec="seconds"))
+
+            where_clauses = [f"{field} = ?" for field in _WETLAB_KEY_FIELDS]
+            key_values = [
+                int(key["replicate"]) if field == "replicate" else str(key[field]).strip()
+                for field in _WETLAB_KEY_FIELDS
+            ]
+            values.extend(key_values)
+
+            sql = (
+                f"UPDATE {_WETLAB_TABLE_NAME} "
+                f"SET {', '.join(set_clauses)} "
+                f"WHERE {' AND '.join(where_clauses)}"
+            )
+            cursor = conn.execute(sql, values)
+            affected = cursor.rowcount
+
+        conn.close()
+        return (
+            "Wetlab result update completed.\n"
+            f"Database: {resolved_db_path}\n"
+            f"Rows updated: {affected}"
+        )
+    except Exception as e:
+        return f"Error updating wetlab result: {str(e)}"
+
+
+def delete_wetlab_result(db_path: str, key: dict) -> str:
+    """Delete one wetlab result row selected by the composite key."""
+    try:
+        key_valid, key_error = _validate_wetlab_key(key)
+        if not key_valid:
+            return f"Error: {key_error}"
+
+        conn, resolved_db_path = _connect_wetlab_db(db_path)
+        with conn:
+            _ensure_wetlab_table(conn)
+            sql = (
+                f"DELETE FROM {_WETLAB_TABLE_NAME} "
+                f"WHERE experiment_id = ? AND sample_id = ? AND assay_name = ? AND condition = ? AND replicate = ?"
+            )
+            values = (
+                str(key["experiment_id"]).strip(),
+                str(key["sample_id"]).strip(),
+                str(key["assay_name"]).strip(),
+                str(key["condition"]).strip(),
+                int(key["replicate"]),
+            )
+            cursor = conn.execute(sql, values)
+            deleted = cursor.rowcount
+
+        conn.close()
+        return (
+            "Wetlab result deletion completed.\n"
+            f"Database: {resolved_db_path}\n"
+            f"Rows deleted: {deleted}"
+        )
+    except Exception as e:
+        return f"Error deleting wetlab result: {str(e)}"
+
+
+def query_wetlab_results(db_path: str, filters: dict | None = None, limit: int = 100) -> str:
+    """Query wetlab results with whitelist-based filters and date range support."""
+    try:
+        if filters is None:
+            filters = {}
+        if not isinstance(filters, dict):
+            return "Error: filters must be a dictionary."
+
+        allowed_filter_keys = set(_WETLAB_QUERYABLE_FIELDS) | {"measured_at_from", "measured_at_to"}
+        unknown_keys = [key for key in filters if key not in allowed_filter_keys]
+        if unknown_keys:
+            return "Error: unsupported filter fields: " + ", ".join(sorted(unknown_keys))
+
+        limit = max(1, int(limit))
+        conn, resolved_db_path = _connect_wetlab_db(db_path)
+        with conn:
+            _ensure_wetlab_table(conn)
+
+            conditions = []
+            values = []
+
+            for field in _WETLAB_QUERYABLE_FIELDS:
+                if field in filters and filters[field] is not None:
+                    value = filters[field]
+                    if field == "replicate":
+                        value = int(value)
+                    else:
+                        value = str(value)
+                    conditions.append(f"{field} = ?")
+                    values.append(value)
+
+            measured_at_from = filters.get("measured_at_from")
+            measured_at_to = filters.get("measured_at_to")
+            if measured_at_from is not None:
+                conditions.append("measured_at >= ?")
+                values.append(str(measured_at_from))
+            if measured_at_to is not None:
+                conditions.append("measured_at <= ?")
+                values.append(str(measured_at_to))
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            count_sql = f"SELECT COUNT(*) AS total_count FROM {_WETLAB_TABLE_NAME} {where_clause}"
+            total_count = conn.execute(count_sql, values).fetchone()["total_count"]
+
+            query_sql = (
+                f"SELECT * FROM {_WETLAB_TABLE_NAME} {where_clause} "
+                "ORDER BY measured_at DESC, result_id DESC LIMIT ?"
+            )
+            query_values = values + [limit]
+            rows = conn.execute(query_sql, query_values).fetchall()
+
+        conn.close()
+
+        lines = [
+            "Wetlab result query completed.",
+            f"Database: {resolved_db_path}",
+            f"Total matched rows: {total_count}",
+            f"Returned rows (limit={limit}): {len(rows)}",
+        ]
+        if not rows:
+            return "\n".join(lines + ["No rows found for the provided filters."])
+
+        columns = [
+            "result_id",
+            "experiment_id",
+            "sample_id",
+            "assay_name",
+            "condition",
+            "replicate",
+            "measurement_value",
+            "measurement_unit",
+            "operator",
+            "instrument",
+            "measured_at",
+            "notes",
+            "created_at",
+            "updated_at",
+        ]
+        table_text = _format_wetlab_rows(columns, rows)
+        return "\n".join(lines + ["", table_text])
+    except Exception as e:
+        return f"Error querying wetlab results: {str(e)}"

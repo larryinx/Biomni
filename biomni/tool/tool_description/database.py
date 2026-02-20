@@ -728,4 +728,112 @@ description = [
             },
         ],
     },
+    {
+        "description": "Search PrimeKG entities by text query with optional entity type filtering.",
+        "name": "query_primekg_entities",
+        "optional_parameters": [
+            {
+                "name": "entity_type",
+                "type": "str",
+                "description": "Entity type filter (e.g., disease, drug, gene) or 'all'",
+                "default": "all",
+            },
+            {
+                "name": "max_results",
+                "type": "int",
+                "description": "Maximum number of matched entities to return",
+                "default": 20,
+            },
+        ],
+        "required_parameters": [
+            {
+                "name": "query",
+                "type": "str",
+                "description": "Text query for entity name/id matching",
+                "default": None,
+            },
+            {
+                "name": "primekg_csv_path",
+                "type": "str",
+                "description": "Local path to the PrimeKG CSV file",
+                "default": None,
+            },
+        ],
+    },
+    {
+        "description": "Retrieve PrimeKG outgoing/incoming neighbors using BFS for 1-hop or 2-hop exploration.",
+        "name": "query_primekg_neighbors",
+        "optional_parameters": [
+            {
+                "name": "hops",
+                "type": "int",
+                "description": "Neighborhood distance in hops (1 or 2)",
+                "default": 1,
+            },
+            {
+                "name": "relation_filter",
+                "type": "str|List[str]",
+                "description": "Optional relation keyword(s) to filter returned edges",
+                "default": None,
+            },
+            {
+                "name": "max_results",
+                "type": "int",
+                "description": "Maximum number of neighbor edges to return",
+                "default": 100,
+            },
+        ],
+        "required_parameters": [
+            {
+                "name": "entity_id",
+                "type": "str",
+                "description": "PrimeKG entity identifier to expand from",
+                "default": None,
+            },
+            {
+                "name": "primekg_csv_path",
+                "type": "str",
+                "description": "Local path to the PrimeKG CSV file",
+                "default": None,
+            },
+        ],
+    },
+    {
+        "description": "Find shortest relationship paths between two PrimeKG entities with BFS.",
+        "name": "query_primekg_path",
+        "optional_parameters": [
+            {
+                "name": "max_hops",
+                "type": "int",
+                "description": "Maximum path length to search",
+                "default": 3,
+            },
+            {
+                "name": "max_paths",
+                "type": "int",
+                "description": "Maximum number of shortest paths to return",
+                "default": 5,
+            },
+        ],
+        "required_parameters": [
+            {
+                "name": "source_entity_id",
+                "type": "str",
+                "description": "Source PrimeKG entity identifier",
+                "default": None,
+            },
+            {
+                "name": "target_entity_id",
+                "type": "str",
+                "description": "Target PrimeKG entity identifier",
+                "default": None,
+            },
+            {
+                "name": "primekg_csv_path",
+                "type": "str",
+                "description": "Local path to the PrimeKG CSV file",
+                "default": None,
+            },
+        ],
+    },
 ]

@@ -109,6 +109,7 @@ library_content_dict = {
     # Structural Biology & Drug Discovery (Python)
     "rdkit": "[Python Package] A collection of cheminformatics and machine learning tools for working with chemical structures and drug discovery.",
     "deeppurpose": "[Python Package] A deep learning library for drug-target interaction prediction and virtual screening.",
+    "deepdr": "[Python Package] A drug response prediction toolkit for context-aware molecule scoring and ranking.",
     "pyscreener": "[Python Package] A Python package for virtual screening of chemical compounds.",
     "openbabel": "[Python Package] A chemical toolbox designed to speak the many languages of chemical data, supporting file format conversion and molecular modeling.",
     "descriptastorus": "[Python Package] A library for computing molecular descriptors for machine learning applications in drug discovery.",
