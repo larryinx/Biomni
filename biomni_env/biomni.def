@@ -1,0 +1,117 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+# =============================================================================
+# File system layout:
+#
+#   /opt/conda/                        -- Miniconda installation
+#   /opt/conda/envs/biomni_e1/         -- conda environment (Python, R, bio tools)
+#   /opt/biomni_tools/                  -- standalone CLI tools (PLINK2, IQ-TREE, etc.)
+#   /opt/biomni_tools/bin/              -- symlinks to CLI tool binaries
+#   /workspace/                         -- agent working directory (writable at runtime)
+#
+# Your package is NOT baked in — bind-mount it at runtime, e.g.:
+#   apptainer exec --bind /path/to/your_pkg:/opt/your_pkg \
+#                  --bind /path/to/workdir:/workspace \
+#                  biomni.sif python /opt/your_pkg/run.py
+#
+# Build as sandbox:
+#   apptainer build --sandbox biomni_sandbox/ biomni.def
+#
+# Build as SIF:
+#   apptainer build biomni.sif biomni.def
+# =============================================================================
+
+%files
+    environment.yml /opt/biomni_build/environment.yml
+    bio_env.yml /opt/biomni_build/bio_env.yml
+    r_packages.yml /opt/biomni_build/r_packages.yml
+    install_r_packages.R /opt/biomni_build/install_r_packages.R
+    install_cli_tools.sh /opt/biomni_build/install_cli_tools.sh
+    cli_tools_config.json /opt/biomni_build/cli_tools_config.json
+
+%environment
+    export CONDA_DEFAULT_ENV="biomni_e1"
+    export CONDA_PREFIX="/opt/conda/envs/biomni_e1"
+    export PATH="/opt/biomni_tools/bin:/opt/conda/envs/biomni_e1/bin:/opt/conda/bin:${PATH}"
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+    # Install system dependencies
+    apt-get update && apt-get install -y \
+        wget \
+        curl \
+        git \
+        build-essential \
+        gcc \
+        make \
+        zlib1g-dev \
+        unzip \
+        jq \
+        perl \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libxml2-dev \
+        libfontconfig1-dev \
+        libharfbuzz-dev \
+        libfribidi-dev \
+        libfreetype6-dev \
+        libpng-dev \
+        libtiff5-dev \
+        libjpeg-dev \
+        libgit2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+    # Install Miniconda
+    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
+        && bash /tmp/miniconda.sh -b -p /opt/conda \
+        && rm /tmp/miniconda.sh \
+        && /opt/conda/bin/conda init
+
+    # Accept conda ToS (required since conda 24.x)
+    /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main || true
+    /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r || true
+
+    export PATH="/opt/conda/bin:${PATH}"
+    cd /opt/biomni_build
+
+    # Step 1: Create base conda environment
+    conda env create -n biomni_e1 -f environment.yml
+
+    # Step 2: Install core bioinformatics tools (BLAST, samtools, scanpy, etc.)
+    conda env update -n biomni_e1 -f bio_env.yml
+
+    # Step 3a: Install R dependency libraries and other packages
+    conda install -y -n biomni_e1 -c conda-forge -c bioconda \
+        libgit2 xz libnetcdf graphviz nlopt weasyprint \
+        r-lme4 bioconductor-rgraphviz
+
+    # Step 3b: Install R packages via conda
+    conda env update -n biomni_e1 -f r_packages.yml
+
+    # Step 4: Install additional R/Bioconductor packages (DESeq2, WGCNA, etc.)
+    export PATH="/opt/conda/envs/biomni_e1/bin:${PATH}"
+    Rscript install_r_packages.R || true
+
+    # Step 5: Install standalone CLI tools (PLINK2, IQ-TREE, GCTA, BWA, etc.)
+    export BIOMNI_TOOLS_DIR="/opt/biomni_tools"
+    export BIOMNI_AUTO_INSTALL=1
+    export NON_INTERACTIVE=1
+    chmod +x install_cli_tools.sh && bash install_cli_tools.sh --auto || true
+
+    # Clean up
+    conda clean -afy
+    rm -rf /opt/biomni_build
+
+    # Create workspace directory
+    mkdir -p /workspace
+
+%runscript
+    exec "$@"
