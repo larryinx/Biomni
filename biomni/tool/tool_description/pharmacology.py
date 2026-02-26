@@ -771,4 +771,36 @@ description = [
             },
         ],
     },
+    {
+        "description": "Rank candidate molecules for a given cell line using a local DeepDR model and inference artifacts.",
+        "name": "rank_molecules_with_deepdr",
+        "required_parameters": [
+            {
+                "default": None,
+                "description": "Cell line context used by DeepDR scoring",
+                "name": "cell_line",
+                "type": "str",
+            },
+            {
+                "default": None,
+                "description": "List of candidate molecules in SMILES format",
+                "name": "smiles_list",
+                "type": "List[str]",
+            },
+            {
+                "default": None,
+                "description": "Local artifact directory containing inference_config.json and model files",
+                "name": "deepdr_artifact_dir",
+                "type": "str",
+            },
+        ],
+        "optional_parameters": [
+            {
+                "default": 20,
+                "description": "Maximum number of ranked molecules to include in the report",
+                "name": "top_k",
+                "type": "int",
+            },
+        ],
+    },
 ]

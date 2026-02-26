@@ -8,6 +8,7 @@ sudo apt-get install git-lfs # or brew install git-lfs if you are on macOS
 git lfs install
 pip install pybiomart
 pip install fair-esm
+pip install deepdr
 pip install uv
 uv pip install transcriptformer
 pip install "zarr>=2.0,<3.0" #this resolved transcripformer download isses

@@ -1,7 +1,9 @@
+import csv
 import json
 import os
 import pickle
 import time
+from collections import defaultdict, deque
 from typing import Any
 
 import requests
@@ -4972,3 +4974,446 @@ def query_encode(
         api_result["result"] = _format_query_results(api_result["result"])
 
     return api_result
+
+
+_PRIMEKG_REQUIRED_COLUMNS = {
+    "x_type",
+    "x_name",
+    "x_id",
+    "relation",
+    "display_relation",
+    "y_type",
+    "y_name",
+    "y_id",
+}
+_primekg_graph_cache: dict[str, dict[str, Any]] = {}
+
+
+def _normalize_primekg_value(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _primekg_relation_passes_filter(relation: str, display_relation: str, relation_filter: str | list[str] | None) -> bool:
+    if relation_filter is None:
+        return True
+
+    if isinstance(relation_filter, str):
+        filters = [relation_filter]
+    else:
+        filters = [item for item in relation_filter if isinstance(item, str)]
+
+    filters = [item.strip().lower() for item in filters if item.strip()]
+    if not filters:
+        return True
+
+    relation_lower = relation.lower()
+    display_relation_lower = display_relation.lower()
+    return any(item in relation_lower or item in display_relation_lower for item in filters)
+
+
+def _load_primekg_graph(primekg_csv_path: str) -> dict[str, Any]:
+    if not primekg_csv_path or not str(primekg_csv_path).strip():
+        return {"success": False, "error": "primekg_csv_path cannot be empty."}
+
+    resolved_path = os.path.abspath(os.path.expanduser(str(primekg_csv_path).strip()))
+    if not os.path.exists(resolved_path):
+        return {"success": False, "error": f"PrimeKG file does not exist: {resolved_path}"}
+
+    if not os.path.isfile(resolved_path):
+        return {"success": False, "error": f"PrimeKG path is not a file: {resolved_path}"}
+
+    file_mtime = os.path.getmtime(resolved_path)
+    cached = _primekg_graph_cache.get(resolved_path)
+    if cached and cached.get("mtime") == file_mtime:
+        return {"success": True, "data": cached["data"]}
+
+    try:
+        with open(resolved_path, encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return {"success": False, "error": "PrimeKG CSV appears empty or missing header."}
+
+            columns = set(reader.fieldnames)
+            missing = sorted(_PRIMEKG_REQUIRED_COLUMNS - columns)
+            if missing:
+                return {
+                    "success": False,
+                    "error": (
+                        "PrimeKG CSV is missing required columns: "
+                        + ", ".join(missing)
+                        + ". Required columns: "
+                        + ", ".join(sorted(_PRIMEKG_REQUIRED_COLUMNS))
+                    ),
+                }
+
+            entities: dict[str, dict[str, str]] = {}
+            adjacency_out: dict[str, list[dict[str, str]]] = defaultdict(list)
+            adjacency_in: dict[str, list[dict[str, str]]] = defaultdict(list)
+            edge_count = 0
+
+            for row in reader:
+                x_id = _normalize_primekg_value(row.get("x_id"))
+                y_id = _normalize_primekg_value(row.get("y_id"))
+                if not x_id or not y_id:
+                    continue
+
+                x_name = _normalize_primekg_value(row.get("x_name")) or x_id
+                y_name = _normalize_primekg_value(row.get("y_name")) or y_id
+                x_type = _normalize_primekg_value(row.get("x_type")) or "unknown"
+                y_type = _normalize_primekg_value(row.get("y_type")) or "unknown"
+                relation = _normalize_primekg_value(row.get("relation"))
+                display_relation = _normalize_primekg_value(row.get("display_relation")) or relation
+
+                if x_id not in entities:
+                    entities[x_id] = {"entity_id": x_id, "entity_name": x_name, "entity_type": x_type}
+                elif entities[x_id]["entity_name"] == x_id and x_name:
+                    entities[x_id]["entity_name"] = x_name
+
+                if y_id not in entities:
+                    entities[y_id] = {"entity_id": y_id, "entity_name": y_name, "entity_type": y_type}
+                elif entities[y_id]["entity_name"] == y_id and y_name:
+                    entities[y_id]["entity_name"] = y_name
+
+                edge_payload = {"neighbor_id": y_id, "relation": relation, "display_relation": display_relation}
+                reverse_edge_payload = {"neighbor_id": x_id, "relation": relation, "display_relation": display_relation}
+                adjacency_out[x_id].append(edge_payload)
+                adjacency_in[y_id].append(reverse_edge_payload)
+                edge_count += 1
+    except UnicodeDecodeError:
+        return {"success": False, "error": "PrimeKG CSV must be UTF-8 encoded."}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to parse PrimeKG CSV: {str(e)}"}
+
+    graph_data = {
+        "path": resolved_path,
+        "entities": entities,
+        "adjacency_out": dict(adjacency_out),
+        "adjacency_in": dict(adjacency_in),
+        "edge_count": edge_count,
+    }
+    _primekg_graph_cache[resolved_path] = {"mtime": file_mtime, "data": graph_data}
+    return {"success": True, "data": graph_data}
+
+
+def _iter_primekg_neighbors(graph: dict[str, Any], entity_id: str):
+    for edge in graph["adjacency_out"].get(entity_id, []):
+        yield edge["neighbor_id"], edge.get("relation", ""), edge.get("display_relation", ""), "outgoing"
+    for edge in graph["adjacency_in"].get(entity_id, []):
+        yield edge["neighbor_id"], edge.get("relation", ""), edge.get("display_relation", ""), "incoming"
+
+
+def query_primekg_entities(
+    query: str,
+    primekg_csv_path: str,
+    entity_type: str = "all",
+    max_results: int = 20,
+) -> str:
+    """Search PrimeKG entities by text query.
+
+    Args:
+        query: Text query against entity names/IDs.
+        primekg_csv_path: Local path to PrimeKG CSV.
+        entity_type: Filter by entity type, or "all".
+        max_results: Maximum number of entities to return.
+
+    Returns:
+        Formatted search result summary.
+
+    """
+    if not query or not str(query).strip():
+        return "Error: query cannot be empty."
+
+    load_result = _load_primekg_graph(primekg_csv_path)
+    if not load_result["success"]:
+        return f"Error loading PrimeKG: {load_result['error']}"
+
+    graph = load_result["data"]
+    query_lower = str(query).strip().lower()
+    entity_type_lower = str(entity_type or "all").strip().lower()
+    try:
+        max_results = max(1, int(max_results))
+    except Exception:
+        return "Error: max_results must be an integer >= 1."
+
+    matches = []
+    for entity in graph["entities"].values():
+        if entity_type_lower != "all" and entity["entity_type"].lower() != entity_type_lower:
+            continue
+
+        name_lower = entity["entity_name"].lower()
+        id_lower = entity["entity_id"].lower()
+        if query_lower in name_lower:
+            rank_key = (0 if name_lower.startswith(query_lower) else 1, len(entity["entity_name"]))
+        elif query_lower in id_lower:
+            rank_key = (2, len(entity["entity_id"]))
+        else:
+            continue
+
+        matches.append((rank_key, entity))
+
+    if not matches:
+        return (
+            f"No PrimeKG entities matched query '{query}'"
+            + ("" if entity_type_lower == "all" else f" with entity_type='{entity_type}'.")
+        )
+
+    matches.sort(key=lambda item: (item[0], item[1]["entity_name"].lower(), item[1]["entity_id"]))
+    selected = [item[1] for item in matches[:max_results]]
+
+    lines = [
+        "PrimeKG Entity Search Results",
+        f"Query: {query}",
+        f"Entity type filter: {entity_type}",
+        f"Matched entities: {len(matches)} (showing up to {max_results})",
+    ]
+    for idx, entity in enumerate(selected, start=1):
+        lines.append(f"{idx}. {entity['entity_id']} | {entity['entity_name']} | type={entity['entity_type']}")
+
+    return "\n".join(lines)
+
+
+def query_primekg_neighbors(
+    entity_id: str,
+    primekg_csv_path: str,
+    hops: int = 1,
+    relation_filter: str | list[str] | None = None,
+    max_results: int = 100,
+) -> str:
+    """Query PrimeKG neighbors around an entity with BFS up to 2 hops.
+
+    Args:
+        entity_id: PrimeKG entity identifier.
+        primekg_csv_path: Local path to PrimeKG CSV.
+        hops: Number of hops from the source (1 or 2).
+        relation_filter: Optional relation keyword(s).
+        max_results: Maximum number of edges to return.
+
+    Returns:
+        Formatted neighborhood summary.
+
+    """
+    if not entity_id or not str(entity_id).strip():
+        return "Error: entity_id cannot be empty."
+
+    try:
+        hops = int(hops)
+    except Exception:
+        return "Error: hops must be an integer (1 or 2)."
+
+    if hops not in (1, 2):
+        return "Error: hops must be 1 or 2."
+
+    try:
+        max_results = max(1, int(max_results))
+    except Exception:
+        return "Error: max_results must be an integer >= 1."
+    source_id = str(entity_id).strip()
+
+    load_result = _load_primekg_graph(primekg_csv_path)
+    if not load_result["success"]:
+        return f"Error loading PrimeKG: {load_result['error']}"
+    graph = load_result["data"]
+
+    if source_id not in graph["entities"]:
+        return f"Entity '{source_id}' was not found in PrimeKG."
+
+    queue = deque([(source_id, 0)])
+    visited_depth = {source_id: 0}
+    results = []
+    seen_edges = set()
+
+    while queue and len(results) < max_results:
+        current_id, depth = queue.popleft()
+        if depth >= hops:
+            continue
+
+        for neighbor_id, relation, display_relation, direction in _iter_primekg_neighbors(graph, current_id):
+            if not _primekg_relation_passes_filter(relation, display_relation, relation_filter):
+                continue
+
+            next_depth = depth + 1
+            edge_key = (current_id, neighbor_id, relation, display_relation, direction, next_depth)
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+
+            results.append(
+                {
+                    "from_id": current_id,
+                    "from_name": graph["entities"].get(current_id, {}).get("entity_name", current_id),
+                    "to_id": neighbor_id,
+                    "to_name": graph["entities"].get(neighbor_id, {}).get("entity_name", neighbor_id),
+                    "to_type": graph["entities"].get(neighbor_id, {}).get("entity_type", "unknown"),
+                    "relation": relation,
+                    "display_relation": display_relation or relation,
+                    "direction": direction,
+                    "hop": next_depth,
+                }
+            )
+            if len(results) >= max_results:
+                break
+
+            best_seen_depth = visited_depth.get(neighbor_id)
+            if best_seen_depth is None or next_depth < best_seen_depth:
+                visited_depth[neighbor_id] = next_depth
+                queue.append((neighbor_id, next_depth))
+
+    if not results:
+        return (
+            f"No neighbors found for entity '{source_id}'"
+            + ("" if relation_filter is None else f" with relation_filter={relation_filter} and hops={hops}.")
+        )
+
+    results.sort(key=lambda item: (item["hop"], item["direction"], item["to_name"].lower(), item["to_id"]))
+    source_name = graph["entities"][source_id]["entity_name"]
+    lines = [
+        "PrimeKG Neighbor Query Results",
+        f"Source entity: {source_id} ({source_name})",
+        f"Hops: {hops}",
+        f"Relation filter: {relation_filter}",
+        f"Returned edges: {len(results)} (max_results={max_results})",
+    ]
+    for idx, item in enumerate(results, start=1):
+        relation_label = item["display_relation"] or item["relation"] or "related_to"
+        if item["direction"] == "outgoing":
+            edge_text = (
+                f"{item['from_name']} ({item['from_id']}) -[{relation_label}]-> "
+                f"{item['to_name']} ({item['to_id']}, type={item['to_type']})"
+            )
+        else:
+            edge_text = (
+                f"{item['from_name']} ({item['from_id']}) <-[{relation_label}]- "
+                f"{item['to_name']} ({item['to_id']}, type={item['to_type']})"
+            )
+        lines.append(f"{idx}. [hop={item['hop']}] {edge_text}")
+
+    return "\n".join(lines)
+
+
+def query_primekg_path(
+    source_entity_id: str,
+    target_entity_id: str,
+    primekg_csv_path: str,
+    max_hops: int = 3,
+    max_paths: int = 5,
+) -> str:
+    """Find shortest relationship paths between two PrimeKG entities.
+
+    Args:
+        source_entity_id: Start entity ID.
+        target_entity_id: Target entity ID.
+        primekg_csv_path: Local path to PrimeKG CSV.
+        max_hops: Maximum path length to explore.
+        max_paths: Maximum number of shortest paths to return.
+
+    Returns:
+        Formatted shortest-path summary.
+
+    """
+    source_id = str(source_entity_id or "").strip()
+    target_id = str(target_entity_id or "").strip()
+    if not source_id or not target_id:
+        return "Error: source_entity_id and target_entity_id are required."
+
+    try:
+        max_hops = int(max_hops)
+        max_paths = int(max_paths)
+    except Exception:
+        return "Error: max_hops and max_paths must be integers."
+
+    if max_hops < 1:
+        return "Error: max_hops must be >= 1."
+    if max_paths < 1:
+        return "Error: max_paths must be >= 1."
+
+    load_result = _load_primekg_graph(primekg_csv_path)
+    if not load_result["success"]:
+        return f"Error loading PrimeKG: {load_result['error']}"
+    graph = load_result["data"]
+
+    if source_id not in graph["entities"]:
+        return f"Source entity '{source_id}' was not found in PrimeKG."
+    if target_id not in graph["entities"]:
+        return f"Target entity '{target_id}' was not found in PrimeKG."
+    if source_id == target_id:
+        entity = graph["entities"][source_id]
+        return f"Source and target are the same entity: {entity['entity_name']} ({source_id})."
+
+    queue = deque([(source_id, [], {source_id})])
+    shortest_len = None
+    paths = []
+    expansion_count = 0
+    max_expansions = 200000
+
+    while queue and len(paths) < max_paths:
+        current_id, path_edges, visited_nodes = queue.popleft()
+        depth = len(path_edges)
+
+        if shortest_len is not None and depth > shortest_len:
+            continue
+
+        if current_id == target_id and depth > 0:
+            if shortest_len is None:
+                shortest_len = depth
+            if depth == shortest_len:
+                paths.append(path_edges)
+            continue
+
+        if depth >= max_hops:
+            continue
+
+        for neighbor_id, relation, display_relation, direction in _iter_primekg_neighbors(graph, current_id):
+            expansion_count += 1
+            if expansion_count > max_expansions:
+                return (
+                    "Search stopped due to graph expansion limit. "
+                    "Try lowering max_hops or querying a more specific entity pair."
+                )
+
+            if neighbor_id in visited_nodes:
+                continue
+
+            relation_label = display_relation or relation or "related_to"
+            next_edge = {
+                "from_id": current_id,
+                "to_id": neighbor_id,
+                "direction": direction,
+                "relation": relation,
+                "display_relation": relation_label,
+            }
+            queue.append((neighbor_id, path_edges + [next_edge], visited_nodes | {neighbor_id}))
+
+    if not paths:
+        source_name = graph["entities"][source_id]["entity_name"]
+        target_name = graph["entities"][target_id]["entity_name"]
+        return (
+            f"No path found between {source_name} ({source_id}) and {target_name} ({target_id}) "
+            f"within max_hops={max_hops}."
+        )
+
+    source_name = graph["entities"][source_id]["entity_name"]
+    target_name = graph["entities"][target_id]["entity_name"]
+    lines = [
+        "PrimeKG Shortest Path Results",
+        f"Source: {source_name} ({source_id})",
+        f"Target: {target_name} ({target_id})",
+        f"Shortest path length: {len(paths[0])}",
+        f"Returned paths: {len(paths)} (max_paths={max_paths})",
+    ]
+
+    for path_idx, path in enumerate(paths, start=1):
+        lines.append(f"Path {path_idx}:")
+        for step_idx, edge in enumerate(path, start=1):
+            from_name = graph["entities"].get(edge["from_id"], {}).get("entity_name", edge["from_id"])
+            to_name = graph["entities"].get(edge["to_id"], {}).get("entity_name", edge["to_id"])
+            relation_label = edge["display_relation"]
+            if edge["direction"] == "outgoing":
+                lines.append(
+                    f"  {step_idx}. {from_name} ({edge['from_id']}) -[{relation_label}]-> {to_name} ({edge['to_id']})"
+                )
+            else:
+                lines.append(
+                    f"  {step_idx}. {from_name} ({edge['from_id']}) <-[{relation_label}]- {to_name} ({edge['to_id']})"
+                )
+
+    return "\n".join(lines)

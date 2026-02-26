@@ -1,3 +1,6 @@
+import importlib
+import inspect
+import json
 import os
 import pickle
 import re
@@ -4280,3 +4283,278 @@ def analyze_fda_safety_signals(
 
     except Exception as e:
         return f"Error analyzing FDA safety signals: {str(e)}"
+
+
+def _call_deepdr_scoring_function(
+    scoring_function,
+    cell_line: str,
+    smiles_list: list[str],
+    model_path: str,
+    deepdr_artifact_dir: str,
+    config: dict,
+):
+    """Call a configurable DeepDR scoring function without swallowing runtime errors."""
+    candidate_values = {
+        "cell_line": cell_line,
+        "smiles_list": smiles_list,
+        "model_path": model_path,
+        "artifact_dir": deepdr_artifact_dir,
+        "config": config,
+    }
+
+    try:
+        signature = inspect.signature(scoring_function)
+    except (TypeError, ValueError):
+        # If signature cannot be inspected, call once with full keyword set so errors are explicit.
+        return scoring_function(**candidate_values)
+
+    params = signature.parameters
+    accepts_var_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+    accepts_var_positional = any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params.values())
+
+    positional_args = []
+    keyword_args = {}
+    missing_required = []
+
+    for param in params.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            continue
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            continue
+
+        has_candidate = param.name in candidate_values
+        if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+            if has_candidate:
+                positional_args.append(candidate_values[param.name])
+            elif param.default is inspect.Parameter.empty:
+                missing_required.append(param.name)
+            continue
+
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            if has_candidate:
+                keyword_args[param.name] = candidate_values[param.name]
+            elif param.default is inspect.Parameter.empty:
+                missing_required.append(param.name)
+
+    if missing_required:
+        raise TypeError(
+            "Configured DeepDR scoring function requires unsupported parameters: "
+            + ", ".join(missing_required)
+        )
+
+    if accepts_var_kw:
+        for key, value in candidate_values.items():
+            if key not in keyword_args and key not in params:
+                keyword_args[key] = value
+
+    if accepts_var_positional and not positional_args:
+        # Preserve compatibility with positional-only style functions expecting the primary inputs first.
+        positional_args = [cell_line, smiles_list]
+
+    return scoring_function(*positional_args, **keyword_args)
+
+
+def _normalize_deepdr_scores(raw_scores, smiles_list: list[str]) -> list[tuple[str, float]]:
+    """Normalize score outputs from different DeepDR interfaces."""
+    if isinstance(raw_scores, dict):
+        missing_smiles = [smiles for smiles in smiles_list if smiles not in raw_scores]
+        if missing_smiles:
+            raise ValueError(
+                "DeepDR scoring output is missing scores for some molecules: "
+                + ", ".join(missing_smiles[:10])
+                + ("" if len(missing_smiles) <= 10 else f" ... (+{len(missing_smiles) - 10} more)")
+            )
+        normalized = []
+        for smiles in smiles_list:
+            normalized.append((smiles, float(raw_scores[smiles])))
+        return normalized
+
+    if isinstance(raw_scores, (list, tuple, np.ndarray)):
+        if len(raw_scores) != len(smiles_list):
+            raise ValueError(
+                f"DeepDR score length mismatch: got {len(raw_scores)} scores for {len(smiles_list)} molecules."
+            )
+        return [(smiles, float(score)) for smiles, score in zip(smiles_list, raw_scores, strict=False)]
+
+    raise TypeError("DeepDR scoring output must be dict, list, tuple, or numpy array.")
+
+
+def _predict_with_default_deepdr_interfaces(deepdr_module, cell_line: str, smiles_list: list[str], model_path: str):
+    """Try common DeepDR interfaces without requiring a fixed upstream API."""
+    if hasattr(deepdr_module, "predict_response"):
+        return deepdr_module.predict_response(cell_line=cell_line, smiles_list=smiles_list, model_path=model_path)
+    if hasattr(deepdr_module, "predict"):
+        return deepdr_module.predict(cell_line=cell_line, smiles_list=smiles_list, model_path=model_path)
+    if hasattr(deepdr_module, "DeepDR"):
+        model_cls = deepdr_module.DeepDR
+        init_signature = inspect.signature(model_cls)
+        init_params = init_signature.parameters
+        accepts_var_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in init_params.values())
+        if "model_path" in init_params or accepts_var_kw:
+            model = model_cls(model_path=model_path)
+        else:
+            model = model_cls(model_path)
+        if hasattr(model, "predict"):
+            return model.predict(cell_line=cell_line, smiles_list=smiles_list)
+    raise AttributeError(
+        "Could not find a supported DeepDR inference interface. "
+        "Provide scoring_module/scoring_function in inference_config.json."
+    )
+
+
+def rank_molecules_with_deepdr(
+    cell_line: str,
+    smiles_list: list[str],
+    deepdr_artifact_dir: str,
+    top_k: int = 20,
+) -> str:
+    """Rank candidate molecules for a cell line using local DeepDR artifacts.
+
+    Args:
+        cell_line: Cell line context for DeepDR scoring.
+        smiles_list: Candidate molecules in SMILES format.
+        deepdr_artifact_dir: Local artifact directory containing inference_config.json.
+        top_k: Number of ranked results to print.
+
+    Returns:
+        A formatted ranking report.
+
+    """
+    if not cell_line or not str(cell_line).strip():
+        return "Error: cell_line cannot be empty."
+    if not isinstance(smiles_list, list) or not smiles_list:
+        return "Error: smiles_list must be a non-empty list of SMILES strings."
+    if not deepdr_artifact_dir or not str(deepdr_artifact_dir).strip():
+        return "Error: deepdr_artifact_dir cannot be empty."
+
+    artifact_dir = os.path.abspath(os.path.expanduser(str(deepdr_artifact_dir).strip()))
+    config_path = os.path.join(artifact_dir, "inference_config.json")
+    if not os.path.isdir(artifact_dir):
+        return f"Error: deepdr_artifact_dir does not exist: {artifact_dir}"
+    if not os.path.isfile(config_path):
+        return (
+            "Error: inference_config.json not found in deepdr_artifact_dir. "
+            f"Expected path: {config_path}"
+        )
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            inference_config = json.load(f)
+    except Exception as e:
+        return f"Error: failed to read inference_config.json: {str(e)}"
+
+    required_config = ["model_path", "score_direction"]
+    missing_config = [key for key in required_config if key not in inference_config]
+    if missing_config:
+        return f"Error: inference_config.json missing required fields: {', '.join(missing_config)}"
+
+    score_direction = str(inference_config.get("score_direction", "")).strip().lower()
+    if score_direction not in {"desc", "asc"}:
+        return "Error: inference_config.json field score_direction must be 'desc' or 'asc'."
+
+    model_path_raw = str(inference_config.get("model_path", "")).strip()
+    if not model_path_raw:
+        return "Error: inference_config.json field model_path cannot be empty."
+    model_path = model_path_raw if os.path.isabs(model_path_raw) else os.path.join(artifact_dir, model_path_raw)
+    model_path = os.path.abspath(os.path.expanduser(model_path))
+    if not os.path.exists(model_path):
+        return f"Error: model_path in inference_config.json does not exist: {model_path}"
+
+    try:
+        from rdkit import Chem
+    except Exception as e:
+        return f"Error: RDKit is required for SMILES validation but could not be imported: {str(e)}"
+
+    valid_smiles = []
+    invalid_smiles = []
+    for smiles in smiles_list:
+        smiles_str = str(smiles).strip()
+        if not smiles_str:
+            invalid_smiles.append(smiles)
+            continue
+        if Chem.MolFromSmiles(smiles_str) is None:
+            invalid_smiles.append(smiles_str)
+            continue
+        valid_smiles.append(smiles_str)
+
+    if not valid_smiles:
+        return (
+            "Error: all SMILES strings are invalid. "
+            f"Invalid entries: {invalid_smiles[:10]}"
+        )
+
+    scoring_module_name = str(inference_config.get("scoring_module", "deepdr")).strip()
+    scoring_function_name = str(inference_config.get("scoring_function", "")).strip()
+
+    try:
+        scoring_module = importlib.import_module(scoring_module_name)
+    except Exception as e:
+        return (
+            "Error: could not import DeepDR module. "
+            f"Tried module='{scoring_module_name}'. "
+            f"Install dependency first (e.g., pip install deepdr). Details: {str(e)}"
+        )
+
+    try:
+        if scoring_function_name:
+            if not hasattr(scoring_module, scoring_function_name):
+                return (
+                    f"Error: scoring_function '{scoring_function_name}' was not found in "
+                    f"module '{scoring_module_name}'."
+                )
+            scoring_function = getattr(scoring_module, scoring_function_name)
+            raw_scores = _call_deepdr_scoring_function(
+                scoring_function=scoring_function,
+                cell_line=str(cell_line).strip(),
+                smiles_list=valid_smiles,
+                model_path=model_path,
+                deepdr_artifact_dir=artifact_dir,
+                config=inference_config,
+            )
+        else:
+            raw_scores = _predict_with_default_deepdr_interfaces(
+                deepdr_module=scoring_module,
+                cell_line=str(cell_line).strip(),
+                smiles_list=valid_smiles,
+                model_path=model_path,
+            )
+
+        scored = _normalize_deepdr_scores(raw_scores, valid_smiles)
+    except Exception as e:
+        return f"Error: DeepDR inference failed: {str(e)}"
+
+    reverse_sort = score_direction == "desc"
+    scored_sorted = sorted(scored, key=lambda item: item[1], reverse=reverse_sort)
+    try:
+        top_k = max(1, int(top_k))
+    except Exception:
+        return "Error: top_k must be an integer >= 1."
+    top_rows = scored_sorted[:top_k]
+
+    lines = [
+        "DeepDR Molecule Ranking Results",
+        f"Cell line: {cell_line}",
+        f"Score direction: {score_direction}",
+        f"Artifact directory: {artifact_dir}",
+        f"Model path: {model_path}",
+        "",
+        "Summary:",
+        f"- Input molecules: {len(smiles_list)}",
+        f"- Valid molecules: {len(valid_smiles)}",
+        f"- Invalid molecules: {len(invalid_smiles)}",
+        f"- Reported top_k: {top_k}",
+        "",
+        "Ranked molecules:",
+    ]
+    for idx, (smiles, score) in enumerate(top_rows, start=1):
+        lines.append(f"{idx}. SMILES={smiles} | score={score:.6f}")
+
+    if invalid_smiles:
+        lines.append("")
+        lines.append("Invalid SMILES entries:")
+        for smiles in invalid_smiles[:20]:
+            lines.append(f"- {smiles}")
+        if len(invalid_smiles) > 20:
+            lines.append(f"- ... and {len(invalid_smiles) - 20} more")
+
+    return "\n".join(lines)
